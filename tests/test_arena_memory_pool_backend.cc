@@ -1,14 +1,3 @@
-// Exercises `ArenaMemoryPool` over a *real* runtime backend (CPU, NVIDIA, ...).
-//
-// `test_arena_memory_pool.cc` already covers the pool's bookkeeping against a
-// mock upstream at kilobyte scale. This test instead instantiates the pool over
-// the backend's actual `runtime::Runtime` specialization, which is where the
-// arena's central claim has to hold: a slice is an *interior offset* into one
-// upstream allocation, so nothing but a real device round trip can prove that
-// the pointer arithmetic lands inside genuine device memory and that two
-// adjacent slices out of the same backing do not overwrite each other. Device
-// pointers cannot be dereferenced from the host, so every check goes through
-// `Memcpy`. The whole suite is skipped when no device is present.
 #include <infini/rt.h>
 #include <infini/rt/arena_memory_pool.h>
 #include INFINI_RT_TEST_RUNTIME_HEADER
@@ -25,16 +14,10 @@ namespace {
 
 using Runtime = infini::rt::runtime::Runtime<INFINI_RT_TEST_DEVICE_TYPE>;
 
-// A megabyte-scale config. The production default reserves 64 MB per backing
-// and ramps to 512 MB, which a shared CI device may not have to spare -- and at
-// that scale a test would never reach the growth, oversize, or shrink paths
-// within a reasonable number of allocations. The ratios that matter are
-// preserved: an 8x doubling headroom to the cap, and a small/large threshold
-// well below it.
 struct BackendConfig {
-  static constexpr std::size_t kInitialCapacity = 4ull << 20;  // 4 MB
-  static constexpr std::size_t kMaxCapacity = 32ull << 20;     // 32 MB
-  static constexpr std::size_t kSmallThreshold = 64ull << 10;  // 64 KB
+  static constexpr std::size_t kInitialCapacity = 4ull << 20;
+  static constexpr std::size_t kMaxCapacity = 32ull << 20;
+  static constexpr std::size_t kSmallThreshold = 64ull << 10;
   static constexpr std::size_t kMinSliceAlignment = 512;
   static constexpr std::size_t kMinSplitRemainder = 512;
   static constexpr std::size_t kShrinkThreshold = 8;
@@ -61,9 +44,6 @@ bool SelectDevice() {
   return true;
 }
 
-// Writes `input` into device memory `ptr` and reads it back, asserting the
-// bytes survive the round trip. This is the only host-safe way to confirm a
-// device pointer is real and usable.
 template <std::size_t N>
 void ExpectUsable(infini::rt::test::TestContext* context, void* ptr,
                   const std::array<std::uint8_t, N>& input,
@@ -82,7 +62,6 @@ void ExpectUsable(infini::rt::test::TestContext* context, void* ptr,
                        "pool-allocated memory should round-trip bytes");
 }
 
-// Fills device memory `[ptr, ptr + size)` with a pattern derived from `seed`.
 bool FillDevice(void* ptr, std::size_t size, std::uint8_t seed) {
   std::vector<std::uint8_t> host(size);
   for (std::size_t i = 0; i < size; ++i) {
@@ -106,8 +85,6 @@ bool VerifyDevice(void* ptr, std::size_t size, std::uint8_t seed) {
   return true;
 }
 
-// A slice returned by the pool must be real, usable device memory -- not just a
-// plausible-looking address computed off a backing base pointer.
 void TestSliceIsUsableDeviceMemory(infini::rt::test::TestContext* context) {
   Pool pool;
   void* ptr = nullptr;
@@ -125,10 +102,6 @@ void TestSliceIsUsableDeviceMemory(infini::rt::test::TestContext* context) {
                        "deallocate should succeed");
 }
 
-// The arena's reason for existing: many slices come out of one device
-// allocation, and every one of them addresses its own disjoint bytes. An
-// off-by-one in the split arithmetic shows up here as one slice reading back a
-// neighbor's pattern.
 void TestSlicesAreDisjointOnDevice(infini::rt::test::TestContext* context) {
   Pool pool;
   constexpr std::size_t kSlices = 24;
@@ -156,7 +129,7 @@ void TestSlicesAreDisjointOnDevice(infini::rt::test::TestContext* context) {
   context->Expect(disjoint, "slices out of one backing must not overlap");
 
   const Pool::Stats stats = pool.GetStats();
-  // 24 x 8 KB = 192 KB, comfortably inside one 4 MB backing.
+
   context->ExpectEqual(stats.upstream_alloc_count, std::size_t{1},
                        "24 slices need only one device allocation");
   context->ExpectEqual(stats.cache_hit_count, kSlices - 1,
@@ -167,9 +140,6 @@ void TestSlicesAreDisjointOnDevice(infini::rt::test::TestContext* context) {
   }
 }
 
-// Coalescing has to work on device memory too: after the slices are released
-// the backing must serve one request spanning all of them, and that whole span
-// must still round-trip bytes.
 void TestCoalescedSpanIsUsable(infini::rt::test::TestContext* context) {
   Pool pool;
   std::vector<void*> blocks;
@@ -182,11 +152,6 @@ void TestCoalescedSpanIsUsable(infini::rt::test::TestContext* context) {
     pool.Deallocate(ptr);
   }
 
-  // Round down to the slice granularity: a request is rounded *up* before it is
-  // fitted, and the extent's own size need not be a multiple of it -- the
-  // backing's head is trimmed by however much the device base pointer was
-  // misaligned. Asking for the raw extent size would round past it and
-  // legitimately need a second backing.
   const std::size_t span = pool.GetStats().largest_free_chunk /
                            BackendConfig::kMinSliceAlignment *
                            BackendConfig::kMinSliceAlignment;
@@ -198,8 +163,7 @@ void TestCoalescedSpanIsUsable(infini::rt::test::TestContext* context) {
                        "the coalesced extent serves a full-span request");
   context->ExpectEqual(pool.GetStats().upstream_alloc_count, std::size_t{1},
                        "serving it needed no new device allocation");
-  // Probe both ends of the span: the arithmetic that produced it has to be
-  // right at the tail, not just at the base.
+
   const std::array<std::uint8_t, 8> input{2, 4, 6, 8, 10, 12, 14, 16};
   ExpectUsable(context, whole, input, "the span's head is usable");
   ExpectUsable(context, static_cast<char*>(whole) + span - 8, input,
@@ -207,12 +171,10 @@ void TestCoalescedSpanIsUsable(infini::rt::test::TestContext* context) {
   pool.Deallocate(whole);
 }
 
-// A requested power-of-two alignment must be honored by the slice, which must
-// still be usable device memory.
 void TestAlignment(infini::rt::test::TestContext* context) {
   Pool pool;
   constexpr std::size_t kAlignment = 4096;
-  // Offset the arena first so the natural next slice is misaligned.
+
   void* filler = nullptr;
   pool.Allocate(&filler, 512);
 
@@ -228,8 +190,6 @@ void TestAlignment(infini::rt::test::TestContext* context) {
   pool.Deallocate(filler);
 }
 
-// A request larger than the capacity cap gets its own exactly sized device
-// allocation, and every byte of it is addressable.
 void TestOversizeRequest(infini::rt::test::TestContext* context) {
   Pool pool;
   constexpr std::size_t kHuge = BackendConfig::kMaxCapacity + (4ull << 20);
@@ -244,9 +204,7 @@ void TestOversizeRequest(infini::rt::test::TestContext* context) {
   const Pool::Stats stats = pool.GetStats();
   context->Expect(stats.bytes_reserved >= kHuge,
                   "the oversize backing covers the request");
-  // At least the request, possibly a little more: the tail left over in the
-  // oversize backing is below `kMinSplitRemainder`, so it stays with the served
-  // chunk as internal waste rather than becoming an unusable sliver.
+
   context->Expect(stats.bytes_in_use >= kHuge,
                   "the whole request is live");
   context->Expect(
@@ -260,9 +218,6 @@ void TestOversizeRequest(infini::rt::test::TestContext* context) {
   pool.Deallocate(ptr);
 }
 
-// The headline behavior on a real device: a burst reserves extra backings, and
-// once the workload returns to small requests the extras go back to the device
-// while the resident backing stays warm.
 void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   Pool pool;
   void* resident = nullptr;
@@ -311,7 +266,6 @@ void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   context->ExpectEqual(stats.upstream_free_count, stats.shrink_count,
                        "every shrink is one device free");
 
-  // The resident backing survived, and the block living in it is intact.
   const std::array<std::uint8_t, 8> input{3, 1, 4, 1, 5, 9, 2, 6};
   ExpectUsable(context, resident, input,
                "the resident slice outlived the shrink");
@@ -321,8 +275,6 @@ void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   }
 }
 
-// `ReleaseCached` hands every drained backing back to the device, and the pool
-// keeps working afterwards.
 void TestReleaseCached(infini::rt::test::TestContext* context) {
   Pool pool;
   std::vector<void*> blocks;
@@ -352,9 +304,6 @@ void TestReleaseCached(infini::rt::test::TestContext* context) {
   pool.Deallocate(fresh);
 }
 
-// The production configuration has to instantiate and work over a real backend,
-// not just the reduced one the rest of this file uses. One small allocation is
-// enough to prove it: it reserves a default-sized backing and slices it.
 void TestDefaultConfigInstantiates(infini::rt::test::TestContext* context) {
   infini::rt::ArenaMemoryPool<Runtime> pool;
   void* ptr = nullptr;
@@ -371,7 +320,7 @@ void TestDefaultConfigInstantiates(infini::rt::test::TestContext* context) {
                        "deallocate should succeed");
 }
 
-}  // namespace
+}
 
 int main() {
   infini::rt::test::TestContext context;

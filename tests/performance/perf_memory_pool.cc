@@ -1,28 +1,3 @@
-// A/B benchmark: the same allocation workload run twice -- straight through the
-// backend allocator, and through `ArenaMemoryPool` -- so the two arms are
-// directly comparable.
-//
-// The arena reserves a large backing once and slices it, so an allocation goes
-// upstream only when the arena has no room. The workloads below are chosen so
-// that difference is visible rather than averaged away: `MissPath` forces a miss
-// every iteration, and `MixedSizeClasses` rotates through sizes that a
-// size-class design could not share but the arena can.
-//
-// Every paired benchmark emits one JSON row per arm, differing only in the
-// `allocator` param (`direct` / `arena`) and sharing the same iteration count and
-// unit, so a consumer can divide one by the other. A human-readable speedup table
-// is written to stderr at the end; stdout stays pure JSON for
-// `scripts/run_performance_tests.py`.
-//
-// `perf_allocator_matrix.cc` covers the shapes this file does not: gigabyte-scale
-// growth, trim cost split into bookkeeping and upstream frees, device-only
-// effects, and the vendor's own stream-ordered pool as a third arm. This file
-// stays on the general shapes -- single block, working-set churn, mixed sizes,
-// first-touch growth, thread scaling.
-//
-// The arena is instantiated over `DispatchUpstream`, an adapter over the
-// `runtime::` dispatch API, so this one file measures whichever backend the
-// library was built with (CPU, NVIDIA, ...) without per-backend variants.
 #include <infini/rt.h>
 #include <infini/rt/arena_memory_pool.h>
 
@@ -45,8 +20,6 @@ namespace {
 namespace perf = infini::rt::perf;
 namespace runtime = infini::rt::runtime;
 
-// Satisfies the arena's upstream contract by forwarding to the dispatch API,
-// which routes to whichever backend is active at runtime.
 struct DispatchUpstream {
   using Error = runtime::Error;
   static constexpr Error kSuccess = runtime::kSuccess;
@@ -58,16 +31,10 @@ struct DispatchUpstream {
   static Error Free(void* ptr) { return runtime::Free(ptr); }
 };
 
-// A megabyte-scale arena config. The production default reserves 64 MB per
-// backing and ramps to 512 MB, which a shared or small device may not have to
-// spare -- and reserving that much would make the arena's numbers a measure of
-// the device's free memory rather than of the allocator. The ratios that matter
-// are preserved: an 8x doubling headroom to the cap, and a small/large threshold
-// well below it.
 struct PerfArenaConfig {
-  static constexpr std::size_t kInitialCapacity = 8ull << 20;   // 8 MB
-  static constexpr std::size_t kMaxCapacity = 64ull << 20;      // 64 MB
-  static constexpr std::size_t kSmallThreshold = 1ull << 20;    // 1 MB
+  static constexpr std::size_t kInitialCapacity = 8ull << 20;
+  static constexpr std::size_t kMaxCapacity = 64ull << 20;
+  static constexpr std::size_t kSmallThreshold = 1ull << 20;
   static constexpr std::size_t kMinSliceAlignment = 512;
   static constexpr std::size_t kMinSplitRemainder = 512;
   static constexpr std::size_t kShrinkThreshold = 16;
@@ -107,8 +74,6 @@ std::vector<std::size_t> TestSizes() {
   return sizes;
 }
 
-// Device allocators cost microseconds per call, so large sizes get few
-// iterations. Both arms of a pair always share this count.
 std::size_t IterationsForSize(std::size_t size) {
   if (size <= 4 * 1024) {
     return 2000;
@@ -130,7 +95,6 @@ std::vector<perf::Param> SizeParams(std::size_t size, const char* allocator) {
           perf::StringParam("allocator", allocator)};
 }
 
-// Renders a byte count for the stderr summary table.
 std::string DescribeSize(std::size_t size) {
   if (size >= 1024 * 1024) {
     return std::to_string(size / (1024 * 1024)) + " MiB";
@@ -141,17 +105,13 @@ std::string DescribeSize(std::size_t size) {
   return std::to_string(size) + " B";
 }
 
-// One comparison row: the same workload measured without a pool and with the
-// arena pool.
 struct Comparison {
   std::string workload;
   std::string params;
   std::string unit;
   double direct_median = 0.0;
   double arena_median = 0.0;
-  // Rows where the direct arm has no counterpart -- a trim has no meaning
-  // without a cache -- print `n/a` in the `no pool` column rather than a zero
-  // that would read as a measurement.
+
   bool has_direct = true;
   bool valid = false;
 };
@@ -165,8 +125,6 @@ void Record(const std::string& workload, const std::string& params,
                                      arena.median, true, true});
 }
 
-// Probes whether `count` blocks of `size` can be held live at once. Large sizes
-// on a small device would otherwise turn a benchmark into an OOM failure.
 bool CanHoldLive(std::size_t size, std::size_t count) {
   std::vector<void*> blocks;
   blocks.reserve(count);
@@ -187,10 +145,6 @@ bool CanHoldLive(std::size_t size, std::size_t count) {
   return ok;
 }
 
-// Workload A: allocate one block, free it, repeat. The simplest shape, and the
-// one where the arena's caching should show its largest win: every iteration
-// after the first is served from the backing, so the upstream allocator is
-// never called.
 void CompareSingleBlock(std::size_t size) {
   const auto iterations = IterationsForSize(size);
 
@@ -228,10 +182,6 @@ void CompareSingleBlock(std::size_t size) {
   Record("SingleBlock", DescribeSize(size), "us", direct, arenaed);
 }
 
-// Workload B: a rolling window of live blocks -- free the oldest, allocate a
-// replacement -- the shape a layer-by-layer inference loop produces. Unlike
-// workload A the allocator never sees an empty backing, so this is the more
-// realistic steady state.
 void CompareWorkingSetChurn(std::size_t size) {
   constexpr std::size_t kLiveBlocks = 8;
   const auto iterations = IterationsForSize(size);
@@ -318,10 +268,6 @@ void CompareWorkingSetChurn(std::size_t size) {
          "us", direct, arenaed);
 }
 
-// Workload C: rotate through many distinct sizes. This is the arena's most
-// favorable shape: one backing serves every size, and coalescing means a freed
-// block of one size feeds a request of another. A direct allocation cannot reuse
-// anything, so it pays the upstream cost on every call.
 void CompareMixedSizeClasses() {
   constexpr std::size_t kClasses = 32;
   constexpr std::size_t kStride = 512;
@@ -378,55 +324,30 @@ void CompareMixedSizeClasses() {
 
   Record("MixedSizeClasses", params, "us", direct, arenaed);
 
-  // The counters are the real story here, and unlike a timing they are exact:
-  // the arena needs one upstream allocation per backing, however many sizes it
-  // serves. Reported as its own row so a regression shows up without having to
-  // read a latency delta.
   perf::PrintResult("perf_memory_pool.MixedSizeClassesUpstreamCalls",
                     arena_params, kIterations, "count",
                     static_cast<double>(arena.GetStats().upstream_alloc_count),
                     static_cast<double>(arena.GetStats().upstream_alloc_count));
 
-  // Reserved bytes price the arena's retention: it holds whole backings, so it
-  // trades memory for the upstream calls it avoids. Reported rather than
-  // asserted, since which side of that trade is right depends on the device.
   perf::PrintResult("perf_memory_pool.MixedSizeClassesBytesReserved",
                     arena_params, kIterations, "bytes",
                     static_cast<double>(arena.GetStats().bytes_reserved),
                     static_cast<double>(arena.GetStats().bytes_reserved));
 
-  // Also carried into the stderr table: a call count is the clearest single
-  // number explaining the timing, and it belongs next to it rather than only in
-  // the JSON. The direct arm has no counter of its own -- every direct
-  // allocation is an upstream call by definition -- so the row is arena-only.
   g_comparisons.push_back(Comparison{
       "MixedSizeClasses/upstream", params, "calls", 0.0,
       static_cast<double>(arena.GetStats().upstream_alloc_count), false, true});
 }
 
-// Runs `op(thread_index, op_index)` concurrently on `threads` threads,
-// `ops_per_thread` times each, and reports nanoseconds per operation. The
-// indices let a workload give each thread a different size.
-//
-// `RunBenchmarkMeasured` cannot host this: its warmup would spawn the thread
-// pool a thousand times, and its lambda measures a single operation rather than
-// a whole concurrent batch.
-// Target duration of one concurrent sample. A batch that finishes in a few
-// microseconds measures thread startup and scheduler placement rather than the
-// allocator, so the op count is calibrated to fill this window.
 constexpr double kTargetSampleMs = 40.0;
 
-// Times `op` single-threaded to estimate its cost, then returns the op count
-// per thread needed to fill `kTargetSampleMs`. This keeps the measurement
-// window comparable across backends: a CPU allocator at tens of nanoseconds
-// gets a large count, a `cudaMalloc` at hundreds of microseconds a small one.
 template <typename Op>
 std::size_t CalibrateOps(std::size_t threads, Op&& op) {
   constexpr std::size_t kProbeOps = 64;
   constexpr std::size_t kMinOps = 50;
   constexpr std::size_t kMaxOps = 200000;
 
-  for (std::size_t i = 0; i < 8; ++i) {  // warm the allocator's caches
+  for (std::size_t i = 0; i < 8; ++i) {
     op(0, i);
   }
 
@@ -479,8 +400,6 @@ perf::Measurement RunThreaded(const std::string& benchmark,
       });
     }
 
-    // Threads are parked on `go`, so thread creation stays out of the timed
-    // region.
     const auto start = std::chrono::steady_clock::now();
     go.store(true, std::memory_order_release);
     for (auto& worker : workers) {
@@ -488,7 +407,6 @@ perf::Measurement RunThreaded(const std::string& benchmark,
     }
     const auto end = std::chrono::steady_clock::now();
 
-    // The first pass is warmup.
     if (sample == 0) {
       continue;
     }
@@ -504,8 +422,6 @@ perf::Measurement RunThreaded(const std::string& benchmark,
   return measurement;
 }
 
-// Workload D: concurrent allocation. The arena serializes every call on one
-// mutex, so this is where it can lose to an allocator that scales.
 void CompareThreadScaling(std::size_t threads) {
   constexpr std::size_t kSize = 4 * 1024;
   const std::string params = std::to_string(threads) + " threads";
@@ -517,8 +433,7 @@ void CompareThreadScaling(std::size_t threads) {
   }
 
   Arena arena;
-  // Calibrate on the arena arm -- the faster of the two -- and give both arms
-  // that count, since a pair is only comparable at equal op counts.
+
   const auto kOpsPerThread =
       CalibrateOps(threads, [&arena](std::size_t, std::size_t) {
         void* ptr = nullptr;
@@ -563,17 +478,11 @@ void CompareThreadScaling(std::size_t threads) {
   Record("ThreadScaling", params, "ns", direct, arenaed);
 }
 
-// Workload E: concurrent allocation spread across many sizes. Each thread starts
-// at a different size and rotates, so at any instant the threads are mostly
-// working on distinct extents -- the shape a multi-stream server produces.
-// `ThreadScaling` hammers a single size instead.
 void CompareConcurrentMixedSizes(std::size_t threads) {
   constexpr std::size_t kClasses = 16;
   constexpr std::size_t kStride = 512;
   const std::string params = std::to_string(threads) + "T x16cls";
 
-  // Stride matches the arena's minimum slice alignment, so the sizes stay
-  // distinct after rounding.
   auto size_for = [](std::size_t thread, std::size_t op) {
     return ((thread + op) % kClasses + 1) * kStride;
   };
@@ -629,11 +538,6 @@ void CompareConcurrentMixedSizes(std::size_t threads) {
   Record("ConcurrentMixedSizes", params, "ns", direct, arenaed);
 }
 
-// The arena's worst case: `ReleaseCached` every iteration empties the cache, so
-// each allocation must call upstream. This isolates the bookkeeping the arena
-// adds on top of a raw allocation. Arena-only -- the extra trim work does not
-// exist for the direct arm -- so read it against this file's `SingleBlock`
-// arena arm at the same size rather than as a speedup over `direct`.
 void MeasureMissPath(std::size_t size) {
   const auto iterations = IterationsForSize(size);
 
@@ -657,13 +561,6 @@ void MeasureMissPath(std::size_t size) {
                      });
 }
 
-// The workload the arena was built for: a growing set of live blocks at mixed
-// sizes, with nothing ever freed until the end. Nothing can be reused -- and
-// that is the point. A direct allocation must call upstream once per block; the
-// arena calls upstream once per backing and slices the rest. The upstream call
-// count is reported alongside the timing because on a host `malloc` the timing
-// understates the gap: an upstream call here costs tens of nanoseconds, where a
-// `cudaMalloc` costs hundreds of microseconds.
 void CompareFirstTouchGrowth() {
   constexpr std::size_t kBlocks = 2000;
   constexpr std::size_t kStride = 512;
@@ -674,16 +571,12 @@ void CompareFirstTouchGrowth() {
     return (index % kClasses + 1) * kStride;
   };
 
-  // Probe the total footprint rather than a single block: this workload holds
-  // every block live at once.
   if (!CanHoldLive(kClasses * kStride, 16)) {
     perf::SkipBenchmark("perf_memory_pool.FirstTouchGrowth",
                         "device allocation failed during probe");
     return;
   }
 
-  // One sample is one full build-up-and-tear-down cycle, so the iteration count
-  // is the block count and the reported unit is per-block.
   std::vector<void*> blocks;
   blocks.reserve(kBlocks);
 
@@ -710,9 +603,6 @@ void CompareFirstTouchGrowth() {
       {perf::NumberParam("blocks", kBlocks),
        perf::StringParam("allocator", "arena")},
       20, "us", [&blocks, &size_for, &arena_upstream] {
-        // A fresh arena each sample: a warm arena would serve the whole build-up
-        // from its backing and measure the opposite of what this benchmark is
-        // for.
         Arena arena;
         for (std::size_t i = 0; i < kBlocks; ++i) {
           void* ptr = nullptr;
@@ -735,23 +625,12 @@ void CompareFirstTouchGrowth() {
                     kBlocks, "count", static_cast<double>(arena_upstream),
                     static_cast<double>(arena_upstream));
 
-  // The direct arm's count is exact rather than measured: one upstream call per
-  // block, by definition.
   g_comparisons.push_back(Comparison{"FirstTouchGrowth/upstream", params,
                                      "calls", static_cast<double>(kBlocks),
                                      static_cast<double>(arena_upstream), true,
                                      true});
 }
 
-// Concurrent miss path: `ReleaseCached` after every operation keeps the backing
-// empty, so each `Allocate` calls upstream. This is the benchmark that prices
-// holding the arena's lock across an upstream call -- if the lock is held, one
-// thread's slow `cudaMalloc` blocks every other thread, and per-operation cost
-// climbs with the thread count even though the work per thread is fixed.
-//
-// Arena-only: there is no meaningful `direct` arm, since the extra
-// `ReleaseCached` work exists only for the arena. Read it as a scaling curve
-// across thread counts, not as a ratio.
 void MeasureConcurrentMissPath(std::size_t threads) {
   constexpr std::size_t kSize = 4 * 1024;
 
@@ -789,11 +668,6 @@ void MeasureConcurrentMissPath(std::size_t threads) {
               });
 }
 
-// Cache hit with an alignment request. The arena splits the leading gap off as a
-// reusable free chunk, so an aligned hit costs more bookkeeping than a plain
-// one. Compare against the `SingleBlock` arena arm at the same size to price the
-// alignment. Arena-only: the dispatch API has no aligned entry point to race it
-// against.
 void MeasureAlignedHit() {
   constexpr std::size_t kSize = 4 * 1024;
   constexpr std::size_t kAlignment = 256;
@@ -822,18 +696,6 @@ void MeasureAlignedHit() {
                      });
 }
 
-// Cost of trimming the cache, measured per cached block. Each iteration refills
-// the cache first, so the reported figure includes that refill.
-//
-// The upstream free count is reported next to the timing, because the timing
-// alone attributes the cost to the wrong thing. A trim does two separable jobs:
-// it walks bookkeeping (an ordered set plus a backing vector), and it issues
-// upstream frees. On a host those cost about the same and the wall time is a
-// fair summary. On a device they do not: every `cudaFree` implicitly
-// synchronizes the whole device, so a design that issues one free per cached
-// block stalls all pending work 64 times where one that frees whole backings
-// stalls it once. Reporting both means the number that transfers to a device is
-// visible even in a host run.
 void MeasureReleaseCached() {
   constexpr std::size_t kSize = 4 * 1024;
   constexpr std::size_t kCachedBlocks = 64;
@@ -845,8 +707,6 @@ void MeasureReleaseCached() {
     return;
   }
 
-  // The arena's trim is cheap by construction: 64 cached blocks live inside one
-  // backing, so a trim is one upstream free rather than 64.
   Arena arena;
   std::vector<void*> blocks(kCachedBlocks, nullptr);
   perf::RunBenchmark("perf_memory_pool.ReleaseCached",
@@ -864,9 +724,6 @@ void MeasureReleaseCached() {
                        arena.ReleaseCached();
                      });
 
-  // Counted in a cycle of its own rather than divided out of the timed run
-  // above: the runner's warmup and sample counts are its business, and dividing
-  // by an assumed total would go quietly wrong the moment either changes.
   const auto before = arena.GetStats().upstream_free_count;
   for (void*& block : blocks) {
     arena.Allocate(&block, kSize);
@@ -884,22 +741,16 @@ void MeasureReleaseCached() {
                      perf::StringParam("allocator", "arena")},
                     1, "count", arena_frees, arena_frees);
 
-  // The direct arm's count is exact rather than measured: freeing the working
-  // set means one upstream free per block.
   g_comparisons.push_back(Comparison{
       "ReleaseCached/frees", std::to_string(kCachedBlocks) + " cached", "calls",
       static_cast<double>(kCachedBlocks), arena_frees, true, true});
 }
 
-// Accessors and no-op paths, all arena-only. `GetStats` reads the largest free
-// extent out of the arena's ordered set, so it does real work and is measured
-// rather than assumed free.
 void MeasureBookkeeping() {
   constexpr std::size_t kIterations = 1000000;
 
   Arena arena;
-  // Hold a spread of live blocks so `GetStats` walks a populated free set rather
-  // than an empty one.
+
   std::vector<void*> live;
   for (std::size_t i = 0; i < 64; ++i) {
     void* ptr = nullptr;
@@ -936,7 +787,6 @@ void MeasureBookkeeping() {
   }
 }
 
-// Human-readable summary on stderr. stdout stays pure JSON.
 void PrintComparisonTable() {
   if (g_comparisons.empty()) {
     return;
@@ -979,7 +829,7 @@ void PrintComparisonTable() {
   std::cerr << std::endl;
 }
 
-}  // namespace
+}
 
 int main() {
   if (!PrepareRuntime()) {
@@ -995,13 +845,6 @@ int main() {
   CompareMixedSizeClasses();
   CompareFirstTouchGrowth();
 
-  // The arena serializes on one mutex, so the curve past a handful of threads is
-  // about how long it holds it. Stopping at 8 was well before the knee on a
-  // many-core host: the interesting region is where the arena's critical section
-  // (ordered-set lookup, split, coalesce) starts to outweigh its far smaller
-  // number of upstream calls, and that only shows up once contention is real.
-  // Counts above the machine's core count are dropped rather than
-  // oversubscribed, which would measure the scheduler.
   const auto hardware_threads = std::max<std::size_t>(
       1, static_cast<std::size_t>(std::thread::hardware_concurrency()));
   for (const std::size_t threads : {std::size_t{1}, std::size_t{2},

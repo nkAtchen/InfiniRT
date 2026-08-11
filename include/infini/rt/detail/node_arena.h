@@ -9,25 +9,6 @@
 
 namespace infini::rt::detail {
 
-/// ## Recycling node storage for a node-based container.
-///
-/// A pool that keeps its free extents in an ordered container (`std::set`) hits
-/// the same problem the pools themselves exist to solve: the container calls
-/// `operator new` once per insert and `operator delete` once per erase. In a
-/// steady-state alloc/free loop that is one host heap round trip per pooled
-/// allocation, which is most of the overhead a pool is meant to remove.
-///
-/// `NodeArena` hands out fixed-size nodes from bulk-allocated blocks and keeps
-/// released nodes on an intrusive free list, so after warm-up a container
-/// backed by it performs no host allocation at all. Blocks are never returned
-/// individually; the whole arena is freed at destruction.
-///
-/// The arena specializes itself to the first node size it sees, which is the
-/// only size a given container ever asks for. Requests of any other size (or a
-/// stricter alignment) fall through to the global allocation functions, so the
-/// arena stays correct even if it is shared or reused.
-///
-/// Not thread-safe: callers serialize access with their own lock.
 class NodeArena {
  public:
   NodeArena() = default;
@@ -43,8 +24,6 @@ class NodeArena {
 
   void* Allocate(std::size_t bytes, std::size_t alignment) {
     if (node_size_ == 0) {
-      // First request fixes the pooled geometry. A node must be able to hold
-      // the free-list link while it is unused.
       node_size_ = std::max(bytes, sizeof(void*));
       node_align_ = std::max(alignment, alignof(void*));
     }
@@ -57,8 +36,7 @@ class NodeArena {
       Grow();
     }
     void* node = free_;
-    // The link lives in the node's own storage; `memcpy` reads it back without
-    // assuming anything about the object that used to be there.
+
     std::memcpy(&free_, node, sizeof(void*));
     return node;
   }
@@ -76,9 +54,6 @@ class NodeArena {
   }
 
  private:
-  // Blocks grow geometrically so a large live set costs a bounded number of
-  // host allocations, then capped so one huge burst does not reserve an
-  // unreasonable block.
   static constexpr std::size_t kInitialNodes = 32;
   static constexpr std::size_t kMaxNodesPerBlock = 4096;
 
@@ -105,9 +80,6 @@ class NodeArena {
   std::size_t next_count_ = kInitialNodes;
 };
 
-/// Standard-library allocator adaptor over a `NodeArena`. The arena is not
-/// owned: it must outlive every container using it, which callers arrange by
-/// declaring the arena before the container it backs.
 template <typename T>
 class ArenaAllocator {
  public:
@@ -116,7 +88,7 @@ class ArenaAllocator {
   explicit ArenaAllocator(NodeArena* arena) : arena_(arena) {}
 
   template <typename U>
-  ArenaAllocator(const ArenaAllocator<U>& other)  // NOLINT: allocator rebind
+  ArenaAllocator(const ArenaAllocator<U>& other)
       : arena_(other.arena()) {}
 
   T* allocate(std::size_t count) {
@@ -151,6 +123,6 @@ class ArenaAllocator {
   NodeArena* arena_;
 };
 
-}  // namespace infini::rt::detail
+}
 
 #endif

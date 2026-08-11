@@ -1,15 +1,3 @@
-// Exercises `ArenaMemoryPool` against a mock upstream allocator.
-//
-// The pool's interesting behaviors -- the growth ramp, oversize backings,
-// automatic shrink -- only trigger at multi-hundred-megabyte scale with the
-// production config, which no CI machine can allocate (and a GPU-less one
-// certainly cannot). That is what `Config` is a template parameter for: these
-// tests instantiate the pool at kilobyte scale and drive exactly the same code
-// paths, with a mock upstream that counts calls and hands out host memory so
-// slices can be written through to prove they do not overlap.
-//
-// `test_arena_memory_pool_backend.cc` covers the same pool over a real device
-// runtime.
 #include <infini/rt/arena_memory_pool.h>
 
 #include <algorithm>
@@ -29,28 +17,14 @@ namespace {
 
 using infini::rt::ArenaMemoryPool;
 
-// --------------------------------------------------------------------------
-// Mock upstream
-// --------------------------------------------------------------------------
-
-// Counting upstream over `std::aligned_alloc`. Real host memory rather than
-// fake pointers, so tests can write through the slices the pool hands out and
-// catch a slicing bug that overlapping ranges would otherwise hide.
-//
-// State is static because the pool takes its upstream as a type, not an
-// instance -- the same shape every `runtime::Runtime<...>` specialization has.
 struct MockUpstream {
   using Error = int;
   static constexpr Error kSuccess = 0;
   static constexpr Error kFailure = 7;
 
-  // Atomic because the pool calls upstream with its own lock released -- by
-  // design, since a device allocator is a slow synchronous call. A real
-  // `cudaMalloc` is thread-safe, so the mock has to be too.
   static std::atomic<std::size_t> malloc_calls;
   static std::atomic<std::size_t> free_calls;
-  // When non-zero, requests strictly larger than this fail. Drives the OOM
-  // fallback chain. Only set while no other thread is running.
+
   static std::size_t capacity_limit;
 
   static void Reset() {
@@ -65,8 +39,7 @@ struct MockUpstream {
       *ptr = nullptr;
       return kFailure;
     }
-    // 256 B matches what `cudaMalloc` guarantees, so the pool's own slice
-    // alignment is what the tests below are actually observing.
+
     void* base = std::aligned_alloc(256, RoundUp(size, 256));
     if (base == nullptr) {
       *ptr = nullptr;
@@ -91,9 +64,6 @@ std::atomic<std::size_t> MockUpstream::malloc_calls{0};
 std::atomic<std::size_t> MockUpstream::free_calls{0};
 std::size_t MockUpstream::capacity_limit = 0;
 
-// Kilobyte-scale mirror of `DefaultArenaConfig`, preserving every ratio that
-// matters: initial capacity, an 8x doubling headroom to the cap, a small/large
-// threshold below the cap, and the same slice granularity.
 struct TinyConfig {
   static constexpr std::size_t kInitialCapacity = 8 * 1024;
   static constexpr std::size_t kMaxCapacity = 64 * 1024;
@@ -106,18 +76,12 @@ struct TinyConfig {
 
 using Pool = ArenaMemoryPool<MockUpstream, TinyConfig>;
 
-// A config that never shrinks automatically, for tests that want to observe
-// fragmentation and reuse without backings disappearing underneath them.
 struct NoShrinkConfig : TinyConfig {
   static constexpr std::size_t kShrinkThreshold =
       static_cast<std::size_t>(-1) / 2;
 };
 
 using StablePool = ArenaMemoryPool<MockUpstream, NoShrinkConfig>;
-
-// --------------------------------------------------------------------------
-// Helpers
-// --------------------------------------------------------------------------
 
 template <typename P>
 void* Alloc(infini::rt::test::TestContext* context, P* pool, std::size_t size,
@@ -129,9 +93,6 @@ void* Alloc(infini::rt::test::TestContext* context, P* pool, std::size_t size,
   return ptr;
 }
 
-// Writes a byte pattern over `[ptr, ptr + size)`. Combined with `Verify`, this
-// is how the tests prove two live slices do not overlap: an overlap shows up as
-// one block reading back another's pattern.
 void Fill(void* ptr, std::size_t size, std::uint8_t seed) {
   auto* bytes = static_cast<std::uint8_t*>(ptr);
   for (std::size_t i = 0; i < size; ++i) {
@@ -149,12 +110,6 @@ bool Verify(const void* ptr, std::size_t size, std::uint8_t seed) {
   return true;
 }
 
-// --------------------------------------------------------------------------
-// Basics
-// --------------------------------------------------------------------------
-
-// One allocation carves a backing store out of the upstream allocator; the
-// pointer is usable and the reported capacity follows the configured ramp.
 void TestFirstAllocation(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -177,8 +132,6 @@ void TestFirstAllocation(infini::rt::test::TestContext* context) {
   pool.Deallocate(ptr);
 }
 
-// A zero-byte request succeeds with a null pointer and touches nothing, and a
-// null `Deallocate` is a no-op -- the same contract `MemoryPool` offers.
 void TestDegenerateRequests(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -196,8 +149,6 @@ void TestDegenerateRequests(infini::rt::test::TestContext* context) {
                        "degenerate requests touch no upstream memory");
 }
 
-// A pointer the pool never handed out, and a double free, are both rejected
-// rather than corrupting the chunk lists.
 void TestForeignPointer(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -213,8 +164,6 @@ void TestForeignPointer(infini::rt::test::TestContext* context) {
                   "a double free must be rejected");
 }
 
-// Many allocations come out of one backing store: this is the whole point of
-// the arena, so the upstream call count must stay at one.
 void TestSlicingAvoidsUpstream(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -226,7 +175,6 @@ void TestSlicingAvoidsUpstream(infini::rt::test::TestContext* context) {
     blocks.push_back(ptr);
   }
 
-  // Every block still reads back its own pattern, so no two slices overlap.
   bool distinct = true;
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     distinct = distinct && Verify(blocks[i], 256,
@@ -245,13 +193,10 @@ void TestSlicingAvoidsUpstream(infini::rt::test::TestContext* context) {
   }
 }
 
-// `alignment` is honored, and the gap skipped to reach the aligned offset comes
-// back as reusable free space rather than leaking.
 void TestAlignment(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
 
-  // Occupy an offset that leaves the next chunk misaligned for a 1 KB request.
   void* filler = Alloc(context, &pool, 64);
   void* aligned = Alloc(context, &pool, 256, 1024);
   context->ExpectEqual(reinterpret_cast<std::uintptr_t>(aligned) % 1024,
@@ -265,16 +210,12 @@ void TestAlignment(infini::rt::test::TestContext* context) {
 
   context->ExpectEqual(after.bytes_in_use, std::size_t{0},
                        "everything has been returned");
-  // Coalescing must reunite the alignment gap with its neighbors, leaving the
-  // backing as one extent again.
+
   context->ExpectEqual(after.largest_free_chunk,
                        before.bytes_reserved - before.bytes_unusable,
                        "the whole backing coalesces back into one chunk");
 }
 
-// With no explicit alignment the pool still guarantees its slice granularity --
-// callers and vectorized kernels rely on the natural alignment a device
-// allocator would have given them.
 void TestNaturalAlignment(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -297,12 +238,6 @@ void TestNaturalAlignment(infini::rt::test::TestContext* context) {
   }
 }
 
-// --------------------------------------------------------------------------
-// Coalescing
-// --------------------------------------------------------------------------
-
-// The property a bump-pointer arena cannot provide: after N adjacent blocks are
-// released, the backing can serve one request spanning all of them again.
 void TestCoalescingRestoresContiguity(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -314,8 +249,6 @@ void TestCoalescingRestoresContiguity(infini::rt::test::TestContext* context) {
   const std::size_t reserved = pool.GetStats().bytes_reserved;
   const std::size_t unusable = pool.GetStats().bytes_unusable;
 
-  // Free in an interleaved order so the merge happens from both sides, not just
-  // as a tidy right-to-left unwind.
   for (std::size_t i : {std::size_t{3}, std::size_t{0}, std::size_t{7},
                         std::size_t{1}, std::size_t{5}, std::size_t{2},
                         std::size_t{6}, std::size_t{4}}) {
@@ -328,7 +261,6 @@ void TestCoalescingRestoresContiguity(infini::rt::test::TestContext* context) {
   context->ExpectEqual(stats.largest_free_chunk, reserved - unusable,
                        "the backing coalesces back into a single extent");
 
-  // And it can actually be handed out as one block again.
   void* whole = nullptr;
   context->ExpectEqual(pool.Allocate(&whole, reserved - unusable),
                        MockUpstream::kSuccess,
@@ -338,8 +270,6 @@ void TestCoalescingRestoresContiguity(infini::rt::test::TestContext* context) {
   pool.Deallocate(whole);
 }
 
-// A released block is reusable at a completely different size, which exact
-// size-class matching could not do.
 void TestReuseAcrossSizes(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -347,7 +277,6 @@ void TestReuseAcrossSizes(infini::rt::test::TestContext* context) {
   void* big = Alloc(context, &pool, 2048);
   pool.Deallocate(big);
 
-  // Four 512 B requests should come out of the 2 KB hole, not a new backing.
   std::vector<void*> blocks;
   for (std::size_t i = 0; i < 4; ++i) {
     blocks.push_back(Alloc(context, &pool, 512));
@@ -359,20 +288,13 @@ void TestReuseAcrossSizes(infini::rt::test::TestContext* context) {
   }
 }
 
-// --------------------------------------------------------------------------
-// Growth
-// --------------------------------------------------------------------------
-
-// Exhausting a backing adds another, and capacity follows the doubling ramp up
-// to the configured cap.
 void TestGrowthRamp(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
 
   std::vector<void*> blocks;
   std::vector<std::size_t> reserved_after;
-  // Keep allocating 2 KB blocks; each backing holds a few, so this walks the
-  // ramp 8 KB -> 16 KB -> 32 KB -> 64 KB.
+
   for (std::size_t i = 0; i < 64; ++i) {
     blocks.push_back(Alloc(context, &pool, 2048));
     reserved_after.push_back(pool.GetStats().bytes_reserved);
@@ -382,12 +304,10 @@ void TestGrowthRamp(infini::rt::test::TestContext* context) {
   context->Expect(stats.backing_count > 1, "growth added backing stores");
   context->ExpectEqual(stats.upstream_alloc_count, stats.backing_count,
                        "one upstream call per backing store");
-  // 64 x 2 KB = 128 KB of demand served by far fewer than 64 upstream calls --
-  // the point of the ramp.
+
   context->Expect(stats.upstream_alloc_count <= 8,
                   "the doubling ramp keeps upstream calls sublinear");
 
-  // No individual step may exceed the cap.
   bool capped = true;
   for (std::size_t i = 1; i < reserved_after.size(); ++i) {
     const std::size_t step = reserved_after[i] - reserved_after[i - 1];
@@ -400,9 +320,6 @@ void TestGrowthRamp(infini::rt::test::TestContext* context) {
   }
 }
 
-// A single request larger than the cap gets its own exactly sized backing:
-// several capped backings cannot serve it, because a slice never spans two
-// upstream allocations.
 void TestOversizeRequest(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -418,8 +335,6 @@ void TestOversizeRequest(infini::rt::test::TestContext* context) {
                   "the oversize backing covers the request");
   context->ExpectEqual(stats.bytes_in_use, kHuge, "the whole request is live");
 
-  // The ramp must not have been advanced by the exception: the next ordinary
-  // backing stays at cap size rather than jumping to 6x the cap.
   pool.Deallocate(ptr);
   const std::size_t before = pool.GetStats().bytes_reserved;
   std::vector<void*> blocks;
@@ -434,21 +349,12 @@ void TestOversizeRequest(infini::rt::test::TestContext* context) {
   }
 }
 
-// --------------------------------------------------------------------------
-// Shrink
-// --------------------------------------------------------------------------
-
-// The headline scenario: a burst allocates extra backings, and once the
-// workload goes back to small requests the extras are returned upstream while
-// the resident backing stays warm.
 void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
 
-  // Warm up the resident backing with a small allocation.
   void* resident_block = Alloc(context, &pool, 128);
 
-  // Burst: large requests force several more backings.
   std::vector<void*> burst;
   for (std::size_t i = 0; i < 24; ++i) {
     burst.push_back(Alloc(context, &pool, 4096));
@@ -456,16 +362,12 @@ void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   const Pool::Stats peak = pool.GetStats();
   context->Expect(peak.backing_count > 1, "the burst added backing stores");
 
-  // The burst finishes.
   for (void* ptr : burst) {
     pool.Deallocate(ptr);
   }
   context->ExpectEqual(pool.GetStats().backing_count, peak.backing_count,
                        "freeing alone does not release backings upstream");
 
-  // Now a run of small requests. Each scan needs `kShrinkThreshold`
-  // allocations, and a non-oversize backing needs `kEmptyScansToDestroy` scans,
-  // so drive enough small work for the hysteresis to play out.
   std::vector<void*> small;
   for (std::size_t i = 0;
        i < TinyConfig::kShrinkThreshold * (TinyConfig::kEmptyScansToDestroy + 2);
@@ -482,7 +384,6 @@ void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   context->Expect(after.bytes_reserved <= TinyConfig::kInitialCapacity,
                   "reserved memory falls back to the resident backing");
 
-  // The resident block was never disturbed.
   context->ExpectEqual(pool.Deallocate(resident_block), MockUpstream::kSuccess,
                        "the resident backing survived the shrink");
   for (void* ptr : small) {
@@ -490,8 +391,6 @@ void TestShrinkAfterBurst(infini::rt::test::TestContext* context) {
   }
 }
 
-// A backing with live blocks is never destroyed, however long the small-request
-// run gets.
 void TestShrinkSpareLiveBackings(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -501,7 +400,7 @@ void TestShrinkSpareLiveBackings(infini::rt::test::TestContext* context) {
   for (std::size_t i = 0; i < 24; ++i) {
     void* ptr = Alloc(context, &pool, 4096);
     if (pool.GetStats().backing_count > 1 && pinned == nullptr) {
-      pinned = ptr;  // Lives in a non-resident backing.
+      pinned = ptr;
       Fill(pinned, 4096, 0x33);
     } else {
       burst.push_back(ptr);
@@ -528,8 +427,6 @@ void TestShrinkSpareLiveBackings(infini::rt::test::TestContext* context) {
   }
 }
 
-// A large request resets the run, so an ongoing burst is never shrunk out from
-// under itself.
 void TestLargeRequestResetsShrinkRun(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -541,7 +438,6 @@ void TestLargeRequestResetsShrinkRun(infini::rt::test::TestContext* context) {
   }
   const std::size_t peak_backings = pool.GetStats().backing_count;
 
-  // Interleave: never `kShrinkThreshold` small requests in a row.
   for (std::size_t round = 0; round < 12; ++round) {
     for (std::size_t i = 0; i < TinyConfig::kShrinkThreshold - 1; ++i) {
       void* ptr = Alloc(context, &pool, 64);
@@ -560,14 +456,10 @@ void TestLargeRequestResetsShrinkRun(infini::rt::test::TestContext* context) {
   }
 }
 
-// Hysteresis: an alternating big/small workload must not destroy and re-create
-// a backing every iteration. `cudaFree` implicitly synchronizes the device, so
-// thrashing would cost more than the memory it reclaims.
 void TestShrinkHysteresis(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
 
-  // Force a second backing to exist, then drive many alternating rounds.
   void* anchor = Alloc(context, &pool, 64);
   std::vector<void*> burst;
   for (std::size_t i = 0; i < 24; ++i) {
@@ -588,7 +480,7 @@ void TestShrinkHysteresis(infini::rt::test::TestContext* context) {
   }
 
   const Pool::Stats stats = pool.GetStats();
-  // Without hysteresis this would be ~one destroy plus one create per round.
+
   context->Expect(stats.shrink_count < kRounds / 2,
                   "hysteresis prevents per-iteration backing thrash");
   context->Expect(stats.upstream_alloc_count < kRounds,
@@ -596,8 +488,6 @@ void TestShrinkHysteresis(infini::rt::test::TestContext* context) {
   pool.Deallocate(anchor);
 }
 
-// An oversize backing skips the hysteresis: holding that much memory idle costs
-// more than the extra upstream call.
 void TestOversizeShrinksPromptly(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   Pool pool;
@@ -607,7 +497,6 @@ void TestOversizeShrinksPromptly(infini::rt::test::TestContext* context) {
   const std::size_t peak_reserved = pool.GetStats().bytes_reserved;
   pool.Deallocate(huge);
 
-  // Exactly one scan's worth of small requests.
   std::vector<void*> small;
   for (std::size_t i = 0; i < TinyConfig::kShrinkThreshold; ++i) {
     small.push_back(Alloc(context, &pool, 64));
@@ -624,12 +513,6 @@ void TestOversizeShrinksPromptly(infini::rt::test::TestContext* context) {
   }
 }
 
-// --------------------------------------------------------------------------
-// ReleaseCached, stats, OOM
-// --------------------------------------------------------------------------
-
-// `ReleaseCached` returns every drained backing, resident one included, and
-// leaves backings with live blocks alone.
 void TestReleaseCached(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -660,7 +543,6 @@ void TestReleaseCached(infini::rt::test::TestContext* context) {
   context->ExpectEqual(stats.upstream_free_count, stats.upstream_alloc_count,
                        "every backing store was freed exactly once");
 
-  // And the pool is still usable, restarting the growth ramp.
   void* fresh = Alloc(context, &pool, 128);
   context->ExpectEqual(pool.GetStats().bytes_reserved,
                        std::size_t{NoShrinkConfig::kInitialCapacity},
@@ -668,8 +550,6 @@ void TestReleaseCached(infini::rt::test::TestContext* context) {
   pool.Deallocate(fresh);
 }
 
-// The byte counters must always close: reserved memory is either in use, free
-// inside a backing, or trimmed off a backing's head.
 void TestStatsBalance(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -715,9 +595,6 @@ void TestStatsBalance(infini::rt::test::TestContext* context) {
                        "every allocation was matched by a free");
 }
 
-// Randomized churn at mixed sizes must not degrade into unusable fragments:
-// the arena has to keep serving requests without an upstream call per
-// allocation, and free space has to stay in usable extents.
 void TestFragmentationUnderChurn(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -743,19 +620,17 @@ void TestFragmentationUnderChurn(infini::rt::test::TestContext* context) {
   }
 
   const StablePool::Stats stats = pool.GetStats();
-  // Upstream calls must scale with the footprint, not the operation count.
+
   context->Expect(stats.upstream_alloc_count < kSteps / 100,
                   "churn does not drive an upstream call per allocation");
-  // Live demand peaked around 48 x 8 KB = 384 KB; a healthy allocator holds a
-  // small multiple of that.
+
   context->Expect(stats.bytes_reserved < 4 * 1024 * 1024,
                   "memory amplification stays bounded under churn");
 
   for (void* ptr : live) {
     pool.Deallocate(ptr);
   }
-  // Fully drained, every backing must have collapsed to one extent, which
-  // `ReleaseCached` can then hand back in full.
+
   pool.ReleaseCached();
   const StablePool::Stats drained = pool.GetStats();
   context->ExpectEqual(drained.bytes_reserved, std::size_t{0},
@@ -765,11 +640,9 @@ void TestFragmentationUnderChurn(infini::rt::test::TestContext* context) {
                        "no backing store leaked across the churn");
 }
 
-// When the upstream allocator cannot satisfy the ramp capacity, the pool falls
-// back to a smaller backing rather than failing the request.
 void TestOomFallbackShrinksRequest(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
-  // Below the 8 KB initial capacity, so the first ramp attempt must fail.
+
   MockUpstream::capacity_limit = 4096;
 
   StablePool pool;
@@ -783,8 +656,6 @@ void TestOomFallbackShrinksRequest(infini::rt::test::TestContext* context) {
   MockUpstream::capacity_limit = 0;
 }
 
-// A request the upstream allocator cannot serve at any size fails cleanly, with
-// a null pointer and the pool still usable.
 void TestOomFailurePropagates(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   MockUpstream::capacity_limit = 1024;
@@ -803,11 +674,6 @@ void TestOomFailurePropagates(infini::rt::test::TestContext* context) {
   pool.Deallocate(recovered);
 }
 
-// Concurrent allocate/free traffic across threads. Each thread writes a pattern
-// unique to itself into every block it holds and checks it before releasing, so
-// a slice handed to two threads at once shows up as corrupted data rather than
-// as a merely suspicious counter. Run under a thread sanitizer this also covers
-// the locking discipline.
 void TestConcurrentTraffic(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   StablePool pool;
@@ -875,8 +741,6 @@ void TestConcurrentTraffic(infini::rt::test::TestContext* context) {
                        "no backing store leaked under concurrency");
 }
 
-// Destruction frees each backing store exactly once. Blocks left outstanding
-// are slices, not upstream pointers, so they must not produce their own frees.
 void TestDestructorFreesBackingsOnce(infini::rt::test::TestContext* context) {
   MockUpstream::Reset();
   std::size_t allocs = 0;
@@ -886,7 +750,7 @@ void TestDestructorFreesBackingsOnce(infini::rt::test::TestContext* context) {
     for (std::size_t i = 0; i < 32; ++i) {
       blocks.push_back(Alloc(context, &pool, 2048));
     }
-    // Deliberately leave half outstanding.
+
     for (std::size_t i = 0; i < blocks.size(); i += 2) {
       pool.Deallocate(blocks[i]);
     }
@@ -901,7 +765,7 @@ void TestDestructorFreesBackingsOnce(infini::rt::test::TestContext* context) {
                        "no upstream allocation leaked");
 }
 
-}  // namespace
+}
 
 int main() {
   infini::rt::test::TestContext context;
