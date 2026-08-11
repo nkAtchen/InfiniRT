@@ -1,27 +1,30 @@
-// A/B/C benchmark: the same allocation workload run three times -- straight
-// through the backend allocator, through `MemoryPool`, and through
-// `ArenaMemoryPool` -- so the three arms are directly comparable.
+// A/B benchmark: the same allocation workload run twice -- straight through the
+// backend allocator, and through `ArenaMemoryPool` -- so the two arms are
+// directly comparable.
 //
-// The two pools differ in where they spend a cache miss. `MemoryPool` keeps
-// freed blocks in per-size-class free lists, so a miss is one upstream call;
-// `ArenaMemoryPool` reserves a large backing once and slices it, so a miss is
+// The arena reserves a large backing once and slices it, so an allocation goes
 // upstream only when the arena has no room. The workloads below are chosen so
 // that difference is visible rather than averaged away: `MissPath` forces a miss
-// every iteration, and `MixedSizeClasses` rotates through classes that the
-// size-class pool cannot share but the arena can.
+// every iteration, and `MixedSizeClasses` rotates through sizes that a
+// size-class design could not share but the arena can.
 //
 // Every paired benchmark emits one JSON row per arm, differing only in the
-// `allocator` param (`direct` / `pool` / `arena`) and sharing the same iteration
-// count and unit, so a consumer can divide any one by another. A human-readable
-// speedup table is written to stderr at the end; stdout stays pure JSON for
+// `allocator` param (`direct` / `arena`) and sharing the same iteration count and
+// unit, so a consumer can divide one by the other. A human-readable speedup table
+// is written to stderr at the end; stdout stays pure JSON for
 // `scripts/run_performance_tests.py`.
 //
-// The pools are instantiated over `DispatchUpstream`, an adapter over the
+// `perf_allocator_matrix.cc` covers the shapes this file does not: gigabyte-scale
+// growth, trim cost split into bookkeeping and upstream frees, device-only
+// effects, and the vendor's own stream-ordered pool as a third arm. This file
+// stays on the general shapes -- single block, working-set churn, mixed sizes,
+// first-touch growth, thread scaling.
+//
+// The arena is instantiated over `DispatchUpstream`, an adapter over the
 // `runtime::` dispatch API, so this one file measures whichever backend the
 // library was built with (CPU, NVIDIA, ...) without per-backend variants.
 #include <infini/rt.h>
 #include <infini/rt/arena_memory_pool.h>
-#include <infini/rt/memory_pool.h>
 
 #include <algorithm>
 #include <atomic>
@@ -42,8 +45,8 @@ namespace {
 namespace perf = infini::rt::perf;
 namespace runtime = infini::rt::runtime;
 
-// Satisfies the `MemoryPool` upstream contract by forwarding to the dispatch
-// API, which routes to whichever backend is active at runtime.
+// Satisfies the arena's upstream contract by forwarding to the dispatch API,
+// which routes to whichever backend is active at runtime.
 struct DispatchUpstream {
   using Error = runtime::Error;
   static constexpr Error kSuccess = runtime::kSuccess;
@@ -54,8 +57,6 @@ struct DispatchUpstream {
 
   static Error Free(void* ptr) { return runtime::Free(ptr); }
 };
-
-using Pool = infini::rt::MemoryPool<DispatchUpstream>;
 
 // A megabyte-scale arena config. The production default reserves 64 MB per
 // backing and ramps to 512 MB, which a shared or small device may not have to
@@ -140,15 +141,18 @@ std::string DescribeSize(std::size_t size) {
   return std::to_string(size) + " B";
 }
 
-// One comparison row: the same workload measured without a pool, with the
-// size-class pool, and with the arena pool.
+// One comparison row: the same workload measured without a pool and with the
+// arena pool.
 struct Comparison {
   std::string workload;
   std::string params;
   std::string unit;
   double direct_median = 0.0;
-  double pool_median = 0.0;
   double arena_median = 0.0;
+  // Rows where the direct arm has no counterpart -- a trim has no meaning
+  // without a cache -- print `n/a` in the `no pool` column rather than a zero
+  // that would read as a measurement.
+  bool has_direct = true;
   bool valid = false;
 };
 
@@ -156,9 +160,9 @@ std::vector<Comparison> g_comparisons;
 
 void Record(const std::string& workload, const std::string& params,
             const std::string& unit, const perf::Measurement& direct,
-            const perf::Measurement& pool, const perf::Measurement& arena) {
+            const perf::Measurement& arena) {
   g_comparisons.push_back(Comparison{workload, params, unit, direct.median,
-                                     pool.median, arena.median, true});
+                                     arena.median, true, true});
 }
 
 // Probes whether `count` blocks of `size` can be held live at once. Large sizes
@@ -184,8 +188,9 @@ bool CanHoldLive(std::size_t size, std::size_t count) {
 }
 
 // Workload A: allocate one block, free it, repeat. The simplest shape, and the
-// one where the pool's caching should show its largest win: every iteration
-// after the first is a cache hit, so the upstream allocator is never called.
+// one where the arena's caching should show its largest win: every iteration
+// after the first is served from the backing, so the upstream allocator is
+// never called.
 void CompareSingleBlock(std::size_t size) {
   const auto iterations = IterationsForSize(size);
 
@@ -207,19 +212,6 @@ void CompareSingleBlock(std::size_t size) {
         }
       });
 
-  Pool pool;
-  const auto pooled = perf::RunBenchmarkMeasured(
-      "perf_memory_pool.SingleBlock", SizeParams(size, "pool"), iterations,
-      "us", [&pool, size] {
-        void* ptr = nullptr;
-        auto status = pool.Allocate(&ptr, size);
-        perf::DoNotOptimize(status);
-        if (Success(status)) {
-          status = pool.Deallocate(ptr);
-          perf::DoNotOptimize(status);
-        }
-      });
-
   Arena arena;
   const auto arenaed = perf::RunBenchmarkMeasured(
       "perf_memory_pool.SingleBlock", SizeParams(size, "arena"), iterations,
@@ -233,12 +225,12 @@ void CompareSingleBlock(std::size_t size) {
         }
       });
 
-  Record("SingleBlock", DescribeSize(size), "us", direct, pooled, arenaed);
+  Record("SingleBlock", DescribeSize(size), "us", direct, arenaed);
 }
 
 // Workload B: a rolling window of live blocks -- free the oldest, allocate a
 // replacement -- the shape a layer-by-layer inference loop produces. Unlike
-// workload A the allocator never sees an empty free list, so this is the more
+// workload A the allocator never sees an empty backing, so this is the more
 // realistic steady state.
 void CompareWorkingSetChurn(std::size_t size) {
   constexpr std::size_t kLiveBlocks = 8;
@@ -291,36 +283,6 @@ void CompareWorkingSetChurn(std::size_t size) {
     }
   }
 
-  Pool pool;
-  std::vector<void*> pool_blocks(kLiveBlocks, nullptr);
-  for (auto& block : pool_blocks) {
-    if (!Success(pool.Allocate(&block, size))) {
-      perf::SkipBenchmark("perf_memory_pool.WorkingSetChurn",
-                          "prefill of the pool arm failed");
-      return;
-    }
-  }
-
-  std::size_t pool_cursor = 0;
-  const auto pooled = perf::RunBenchmarkMeasured(
-      "perf_memory_pool.WorkingSetChurn", make_params("pool"), iterations, "us",
-      [&pool, &pool_blocks, &pool_cursor, size] {
-        void*& slot = pool_blocks[pool_cursor];
-        pool_cursor = (pool_cursor + 1) % kLiveBlocks;
-        auto status = pool.Deallocate(slot);
-        slot = nullptr;
-        if (Success(status)) {
-          status = pool.Allocate(&slot, size);
-        }
-        perf::DoNotOptimize(status);
-      });
-
-  for (void* block : pool_blocks) {
-    if (block != nullptr) {
-      pool.Deallocate(block);
-    }
-  }
-
   Arena arena;
   std::vector<void*> arena_blocks(kLiveBlocks, nullptr);
   for (auto& block : arena_blocks) {
@@ -353,14 +315,13 @@ void CompareWorkingSetChurn(std::size_t size) {
 
   Record("WorkingSetChurn",
          DescribeSize(size) + " x" + std::to_string(kLiveBlocks) + " live",
-         "us", direct, pooled, arenaed);
+         "us", direct, arenaed);
 }
 
-// Workload C: rotate through many distinct size classes. This is the size-class
-// pool's least favorable shape -- every class needs its own upstream allocation
-// before it can start hitting, and each request pays a free-list hash lookup --
-// and the arena's most favorable one, since one backing serves every class and
-// coalescing means a freed block of one size feeds a request of another.
+// Workload C: rotate through many distinct sizes. This is the arena's most
+// favorable shape: one backing serves every size, and coalescing means a freed
+// block of one size feeds a request of another. A direct allocation cannot reuse
+// anything, so it pays the upstream cost on every call.
 void CompareMixedSizeClasses() {
   constexpr std::size_t kClasses = 32;
   constexpr std::size_t kStride = 512;
@@ -379,10 +340,6 @@ void CompareMixedSizeClasses() {
       perf::NumberParam("size_classes", kClasses),
       perf::NumberParam("stride_bytes", kStride),
       perf::StringParam("allocator", "direct")};
-  std::vector<perf::Param> pool_params{
-      perf::NumberParam("size_classes", kClasses),
-      perf::NumberParam("stride_bytes", kStride),
-      perf::StringParam("allocator", "pool")};
   std::vector<perf::Param> arena_params{
       perf::NumberParam("size_classes", kClasses),
       perf::NumberParam("stride_bytes", kStride),
@@ -403,22 +360,6 @@ void CompareMixedSizeClasses() {
         }
       });
 
-  Pool pool;
-  std::size_t pool_index = 0;
-  const auto pooled = perf::RunBenchmarkMeasured(
-      "perf_memory_pool.MixedSizeClasses", pool_params, kIterations, "us",
-      [&pool, &pool_index, &size_for] {
-        const auto size = size_for(pool_index);
-        pool_index = (pool_index + 1) % kClasses;
-        void* ptr = nullptr;
-        auto status = pool.Allocate(&ptr, size);
-        perf::DoNotOptimize(status);
-        if (Success(status)) {
-          status = pool.Deallocate(ptr);
-          perf::DoNotOptimize(status);
-        }
-      });
-
   Arena arena;
   std::size_t arena_index = 0;
   const auto arenaed = perf::RunBenchmarkMeasured(
@@ -435,47 +376,37 @@ void CompareMixedSizeClasses() {
         }
       });
 
-  Record("MixedSizeClasses", params, "us", direct, pooled, arenaed);
+  Record("MixedSizeClasses", params, "us", direct, arenaed);
 
   // The counters are the real story here, and unlike a timing they are exact:
-  // the size-class pool needs one upstream allocation per class, the arena one
-  // per backing. Reported as their own rows so a regression in either shows up
-  // without having to read a latency delta.
-  perf::PrintResult("perf_memory_pool.MixedSizeClassesUpstreamCalls",
-                    pool_params, kIterations, "count",
-                    static_cast<double>(pool.GetStats().upstream_alloc_count),
-                    static_cast<double>(pool.GetStats().upstream_alloc_count));
+  // the arena needs one upstream allocation per backing, however many sizes it
+  // serves. Reported as its own row so a regression shows up without having to
+  // read a latency delta.
   perf::PrintResult("perf_memory_pool.MixedSizeClassesUpstreamCalls",
                     arena_params, kIterations, "count",
                     static_cast<double>(arena.GetStats().upstream_alloc_count),
                     static_cast<double>(arena.GetStats().upstream_alloc_count));
 
-  // Reserved bytes price the two designs' retention: the size-class pool holds a
-  // block per class it ever saw, the arena holds whole backings. Neither is
-  // strictly better, so this is reported rather than asserted.
-  perf::PrintResult("perf_memory_pool.MixedSizeClassesBytesReserved",
-                    pool_params, kIterations, "bytes",
-                    static_cast<double>(pool.GetStats().bytes_reserved),
-                    static_cast<double>(pool.GetStats().bytes_reserved));
+  // Reserved bytes price the arena's retention: it holds whole backings, so it
+  // trades memory for the upstream calls it avoids. Reported rather than
+  // asserted, since which side of that trade is right depends on the device.
   perf::PrintResult("perf_memory_pool.MixedSizeClassesBytesReserved",
                     arena_params, kIterations, "bytes",
                     static_cast<double>(arena.GetStats().bytes_reserved),
                     static_cast<double>(arena.GetStats().bytes_reserved));
 
   // Also carried into the stderr table: a call count is the clearest single
-  // number distinguishing the two designs, and it belongs next to the timings
-  // rather than only in the JSON. There is no `direct` arm -- every direct
-  // allocation is an upstream call by definition -- so the row is marked
-  // pool-only.
+  // number explaining the timing, and it belongs next to it rather than only in
+  // the JSON. The direct arm has no counter of its own -- every direct
+  // allocation is an upstream call by definition -- so the row is arena-only.
   g_comparisons.push_back(Comparison{
       "MixedSizeClasses/upstream", params, "calls", 0.0,
-      static_cast<double>(pool.GetStats().upstream_alloc_count),
-      static_cast<double>(arena.GetStats().upstream_alloc_count), true});
+      static_cast<double>(arena.GetStats().upstream_alloc_count), false, true});
 }
 
 // Runs `op(thread_index, op_index)` concurrently on `threads` threads,
 // `ops_per_thread` times each, and reports nanoseconds per operation. The
-// indices let a workload give each thread a different size class.
+// indices let a workload give each thread a different size.
 //
 // `RunBenchmarkMeasured` cannot host this: its warmup would spawn the thread
 // pool a thousand times, and its lambda measures a single operation rather than
@@ -573,8 +504,8 @@ perf::Measurement RunThreaded(const std::string& benchmark,
   return measurement;
 }
 
-// Workload D: concurrent allocation. The pool serializes every call on one
-// mutex, so this is where a shared pool can lose to an allocator that scales.
+// Workload D: concurrent allocation. The arena serializes every call on one
+// mutex, so this is where it can lose to an allocator that scales.
 void CompareThreadScaling(std::size_t threads) {
   constexpr std::size_t kSize = 4 * 1024;
   const std::string params = std::to_string(threads) + " threads";
@@ -585,14 +516,14 @@ void CompareThreadScaling(std::size_t threads) {
     return;
   }
 
-  Pool pool;
-  // Calibrate on the pool arm -- the faster of the two -- and give both arms
+  Arena arena;
+  // Calibrate on the arena arm -- the faster of the two -- and give both arms
   // that count, since a pair is only comparable at equal op counts.
   const auto kOpsPerThread =
-      CalibrateOps(threads, [&pool](std::size_t, std::size_t) {
+      CalibrateOps(threads, [&arena](std::size_t, std::size_t) {
         void* ptr = nullptr;
-        if (Success(pool.Allocate(&ptr, kSize))) {
-          pool.Deallocate(ptr);
+        if (Success(arena.Allocate(&ptr, kSize))) {
+          arena.Deallocate(ptr);
         }
       });
 
@@ -601,11 +532,6 @@ void CompareThreadScaling(std::size_t threads) {
       perf::NumberParam("size_bytes", kSize),
       perf::NumberParam("ops_per_thread", kOpsPerThread),
       perf::StringParam("allocator", "direct")};
-  std::vector<perf::Param> pool_params{
-      perf::NumberParam("threads", threads),
-      perf::NumberParam("size_bytes", kSize),
-      perf::NumberParam("ops_per_thread", kOpsPerThread),
-      perf::StringParam("allocator", "pool")};
   std::vector<perf::Param> arena_params{
       perf::NumberParam("threads", threads),
       perf::NumberParam("size_bytes", kSize),
@@ -623,18 +549,6 @@ void CompareThreadScaling(std::size_t threads) {
                     perf::DoNotOptimize(status);
                   });
 
-  const auto pooled =
-      RunThreaded("perf_memory_pool.ThreadScaling", pool_params, threads,
-                  kOpsPerThread, [&pool](std::size_t, std::size_t) {
-                    void* ptr = nullptr;
-                    auto status = pool.Allocate(&ptr, kSize);
-                    if (Success(status)) {
-                      status = pool.Deallocate(ptr);
-                    }
-                    perf::DoNotOptimize(status);
-                  });
-
-  Arena arena;
   const auto arenaed =
       RunThreaded("perf_memory_pool.ThreadScaling", arena_params, threads,
                   kOpsPerThread, [&arena](std::size_t, std::size_t) {
@@ -646,20 +560,19 @@ void CompareThreadScaling(std::size_t threads) {
                     perf::DoNotOptimize(status);
                   });
 
-  Record("ThreadScaling", params, "ns", direct, pooled, arenaed);
+  Record("ThreadScaling", params, "ns", direct, arenaed);
 }
 
-// Workload E: concurrent allocation spread across many size classes. Each
-// thread starts at a different class and rotates, so at any instant the threads
-// are mostly working on distinct buckets -- the shape a multi-stream server
-// produces, and the one a sharded free list could exploit. `ThreadScaling`
-// hammers a single class instead, where sharding by size class cannot help.
+// Workload E: concurrent allocation spread across many sizes. Each thread starts
+// at a different size and rotates, so at any instant the threads are mostly
+// working on distinct extents -- the shape a multi-stream server produces.
+// `ThreadScaling` hammers a single size instead.
 void CompareConcurrentMixedSizes(std::size_t threads) {
   constexpr std::size_t kClasses = 16;
   constexpr std::size_t kStride = 512;
   const std::string params = std::to_string(threads) + "T x16cls";
 
-  // Stride matches the pool's small-size granularity, so the classes stay
+  // Stride matches the arena's minimum slice alignment, so the sizes stay
   // distinct after rounding.
   auto size_for = [](std::size_t thread, std::size_t op) {
     return ((thread + op) % kClasses + 1) * kStride;
@@ -671,12 +584,12 @@ void CompareConcurrentMixedSizes(std::size_t threads) {
     return;
   }
 
-  Pool pool;
+  Arena arena;
   const auto kOpsPerThread =
-      CalibrateOps(threads, [&pool, &size_for](std::size_t t, std::size_t op) {
+      CalibrateOps(threads, [&arena, &size_for](std::size_t t, std::size_t op) {
         void* ptr = nullptr;
-        if (Success(pool.Allocate(&ptr, size_for(t, op)))) {
-          pool.Deallocate(ptr);
+        if (Success(arena.Allocate(&ptr, size_for(t, op)))) {
+          arena.Deallocate(ptr);
         }
       });
 
@@ -685,11 +598,6 @@ void CompareConcurrentMixedSizes(std::size_t threads) {
       perf::NumberParam("size_classes", kClasses),
       perf::NumberParam("ops_per_thread", kOpsPerThread),
       perf::StringParam("allocator", "direct")};
-  std::vector<perf::Param> pool_params{
-      perf::NumberParam("threads", threads),
-      perf::NumberParam("size_classes", kClasses),
-      perf::NumberParam("ops_per_thread", kOpsPerThread),
-      perf::StringParam("allocator", "pool")};
   std::vector<perf::Param> arena_params{
       perf::NumberParam("threads", threads),
       perf::NumberParam("size_classes", kClasses),
@@ -707,18 +615,6 @@ void CompareConcurrentMixedSizes(std::size_t threads) {
         perf::DoNotOptimize(status);
       });
 
-  const auto pooled = RunThreaded(
-      "perf_memory_pool.ConcurrentMixedSizes", pool_params, threads,
-      kOpsPerThread, [&pool, &size_for](std::size_t thread, std::size_t op) {
-        void* ptr = nullptr;
-        auto status = pool.Allocate(&ptr, size_for(thread, op));
-        if (Success(status)) {
-          status = pool.Deallocate(ptr);
-        }
-        perf::DoNotOptimize(status);
-      });
-
-  Arena arena;
   const auto arenaed = RunThreaded(
       "perf_memory_pool.ConcurrentMixedSizes", arena_params, threads,
       kOpsPerThread, [&arena, &size_for](std::size_t thread, std::size_t op) {
@@ -730,14 +626,14 @@ void CompareConcurrentMixedSizes(std::size_t threads) {
         perf::DoNotOptimize(status);
       });
 
-  Record("ConcurrentMixedSizes", params, "ns", direct, pooled, arenaed);
+  Record("ConcurrentMixedSizes", params, "ns", direct, arenaed);
 }
 
-// Both pools' worst case: `ReleaseCached` every iteration empties the cache, so
-// each allocation must call upstream. This isolates the bookkeeping a pool adds
-// on top of a raw allocation. Pool-only — the extra trim work does not exist for
-// the direct arm — so read the two pool arms against each other rather than as a
-// speedup over `direct`.
+// The arena's worst case: `ReleaseCached` every iteration empties the cache, so
+// each allocation must call upstream. This isolates the bookkeeping the arena
+// adds on top of a raw allocation. Arena-only -- the extra trim work does not
+// exist for the direct arm -- so read it against this file's `SingleBlock`
+// arena arm at the same size rather than as a speedup over `direct`.
 void MeasureMissPath(std::size_t size) {
   const auto iterations = IterationsForSize(size);
 
@@ -746,19 +642,6 @@ void MeasureMissPath(std::size_t size) {
                         "device allocation failed during probe");
     return;
   }
-
-  Pool pool;
-  perf::RunBenchmark("perf_memory_pool.MissPath",
-                     SizeParams(size, "pool"), iterations, "us",
-                     [&pool, size] {
-                       void* ptr = nullptr;
-                       auto status = pool.Allocate(&ptr, size);
-                       if (Success(status)) {
-                         status = pool.Deallocate(ptr);
-                       }
-                       perf::DoNotOptimize(status);
-                       pool.ReleaseCached();
-                     });
 
   Arena arena;
   perf::RunBenchmark("perf_memory_pool.MissPath",
@@ -775,12 +658,12 @@ void MeasureMissPath(std::size_t size) {
 }
 
 // The workload the arena was built for: a growing set of live blocks at mixed
-// sizes, with nothing ever freed until the end. Neither pool can reuse anything,
-// so every allocation is a miss -- and that is the point. `MemoryPool` must call
-// upstream once per block; the arena calls upstream once per backing and slices
-// the rest. The upstream call count is reported alongside the timing because on
-// a host `malloc` the timing understates the gap: an upstream call here costs
-// tens of nanoseconds, where a `cudaMalloc` costs hundreds of microseconds.
+// sizes, with nothing ever freed until the end. Nothing can be reused -- and
+// that is the point. A direct allocation must call upstream once per block; the
+// arena calls upstream once per backing and slices the rest. The upstream call
+// count is reported alongside the timing because on a host `malloc` the timing
+// understates the gap: an upstream call here costs tens of nanoseconds, where a
+// `cudaMalloc` costs hundreds of microseconds.
 void CompareFirstTouchGrowth() {
   constexpr std::size_t kBlocks = 2000;
   constexpr std::size_t kStride = 512;
@@ -821,34 +704,15 @@ void CompareFirstTouchGrowth() {
         blocks.clear();
       });
 
-  std::size_t pool_upstream = 0;
-  const auto pooled = perf::RunBenchmarkMeasured(
-      "perf_memory_pool.FirstTouchGrowth",
-      {perf::NumberParam("blocks", kBlocks),
-       perf::StringParam("allocator", "pool")},
-      20, "us", [&blocks, &size_for, &pool_upstream] {
-        // A fresh pool each sample: a warm pool would serve the whole build-up
-        // from its cache and measure the opposite of what this benchmark is for.
-        Pool pool;
-        for (std::size_t i = 0; i < kBlocks; ++i) {
-          void* ptr = nullptr;
-          if (Success(pool.Allocate(&ptr, size_for(i)))) {
-            blocks.push_back(ptr);
-          }
-        }
-        pool_upstream = pool.GetStats().upstream_alloc_count;
-        for (void* ptr : blocks) {
-          pool.Deallocate(ptr);
-        }
-        blocks.clear();
-      });
-
   std::size_t arena_upstream = 0;
   const auto arenaed = perf::RunBenchmarkMeasured(
       "perf_memory_pool.FirstTouchGrowth",
       {perf::NumberParam("blocks", kBlocks),
        perf::StringParam("allocator", "arena")},
       20, "us", [&blocks, &size_for, &arena_upstream] {
+        // A fresh arena each sample: a warm arena would serve the whole build-up
+        // from its backing and measure the opposite of what this benchmark is
+        // for.
         Arena arena;
         for (std::size_t i = 0; i < kBlocks; ++i) {
           void* ptr = nullptr;
@@ -863,35 +727,30 @@ void CompareFirstTouchGrowth() {
         blocks.clear();
       });
 
-  Record("FirstTouchGrowth", params, "us", direct, pooled, arenaed);
+  Record("FirstTouchGrowth", params, "us", direct, arenaed);
 
-  perf::PrintResult("perf_memory_pool.FirstTouchGrowthUpstreamCalls",
-                    {perf::NumberParam("blocks", kBlocks),
-                     perf::StringParam("allocator", "pool")},
-                    kBlocks, "count", static_cast<double>(pool_upstream),
-                    static_cast<double>(pool_upstream));
   perf::PrintResult("perf_memory_pool.FirstTouchGrowthUpstreamCalls",
                     {perf::NumberParam("blocks", kBlocks),
                      perf::StringParam("allocator", "arena")},
                     kBlocks, "count", static_cast<double>(arena_upstream),
                     static_cast<double>(arena_upstream));
 
+  // The direct arm's count is exact rather than measured: one upstream call per
+  // block, by definition.
   g_comparisons.push_back(Comparison{"FirstTouchGrowth/upstream", params,
                                      "calls", static_cast<double>(kBlocks),
-                                     static_cast<double>(pool_upstream),
-                                     static_cast<double>(arena_upstream),
+                                     static_cast<double>(arena_upstream), true,
                                      true});
 }
 
-// Concurrent miss path: `ReleaseCached` after every operation keeps the free
-// list empty, so each `Allocate` calls upstream. This is the benchmark that
-// prices holding the pool's lock across an upstream call -- if the lock is
-// held, one thread's slow `cudaMalloc` blocks every other thread, and
-// per-operation cost climbs with the thread count even though the work per
-// thread is fixed.
+// Concurrent miss path: `ReleaseCached` after every operation keeps the backing
+// empty, so each `Allocate` calls upstream. This is the benchmark that prices
+// holding the arena's lock across an upstream call -- if the lock is held, one
+// thread's slow `cudaMalloc` blocks every other thread, and per-operation cost
+// climbs with the thread count even though the work per thread is fixed.
 //
-// Pool-only: there is no meaningful `direct` arm, since the extra
-// `ReleaseCached` work exists only for the pool. Read it as a scaling curve
+// Arena-only: there is no meaningful `direct` arm, since the extra
+// `ReleaseCached` work exists only for the arena. Read it as a scaling curve
 // across thread counts, not as a ratio.
 void MeasureConcurrentMissPath(std::size_t threads) {
   constexpr std::size_t kSize = 4 * 1024;
@@ -902,34 +761,18 @@ void MeasureConcurrentMissPath(std::size_t threads) {
     return;
   }
 
-  Pool pool;
-  auto miss_op = [&pool](std::size_t, std::size_t) {
+  Arena arena;
+  auto miss_op = [&arena](std::size_t, std::size_t) {
     void* ptr = nullptr;
-    const auto status = pool.Allocate(&ptr, kSize);
+    const auto status = arena.Allocate(&ptr, kSize);
     if (Success(status)) {
-      pool.Deallocate(ptr);
+      arena.Deallocate(ptr);
     }
     perf::DoNotOptimize(status);
-    pool.ReleaseCached();
+    arena.ReleaseCached();
   };
   const auto kOpsPerThread = CalibrateOps(threads, miss_op);
 
-  RunThreaded("perf_memory_pool.ConcurrentMissPath",
-              {perf::NumberParam("threads", threads),
-               perf::NumberParam("size_bytes", kSize),
-               perf::NumberParam("ops_per_thread", kOpsPerThread),
-               perf::StringParam("allocator", "pool")},
-              threads, kOpsPerThread, [&pool](std::size_t, std::size_t) {
-                void* ptr = nullptr;
-                auto status = pool.Allocate(&ptr, kSize);
-                if (Success(status)) {
-                  status = pool.Deallocate(ptr);
-                }
-                perf::DoNotOptimize(status);
-                pool.ReleaseCached();
-              });
-
-  Arena arena;
   RunThreaded("perf_memory_pool.ConcurrentMissPath",
               {perf::NumberParam("threads", threads),
                perf::NumberParam("size_bytes", kSize),
@@ -946,46 +789,24 @@ void MeasureConcurrentMissPath(std::size_t threads) {
               });
 }
 
-// Cache hit with an alignment request. The two pools reach it differently:
-// `MemoryPool` over-allocates by the alignment upstream and aligns up, while the
-// arena splits the leading gap off as a reusable free chunk. Compare each against
-// its own `SingleBlock` arm at the same size to price the alignment.
+// Cache hit with an alignment request. The arena splits the leading gap off as a
+// reusable free chunk, so an aligned hit costs more bookkeeping than a plain
+// one. Compare against the `SingleBlock` arena arm at the same size to price the
+// alignment. Arena-only: the dispatch API has no aligned entry point to race it
+// against.
 void MeasureAlignedHit() {
   constexpr std::size_t kSize = 4 * 1024;
   constexpr std::size_t kAlignment = 256;
   constexpr std::size_t kIterations = 200000;
 
-  Pool pool;
+  Arena arena;
   void* probe = nullptr;
-  if (!Success(pool.Allocate(&probe, kSize, kAlignment)) || probe == nullptr) {
+  if (!Success(arena.Allocate(&probe, kSize, kAlignment)) || probe == nullptr) {
     perf::SkipBenchmark("perf_memory_pool.AlignedHit",
                         "aligned allocation failed during probe");
     return;
   }
-  pool.Deallocate(probe);
-
-  perf::RunBenchmark("perf_memory_pool.AlignedHit",
-                     {perf::NumberParam("size_bytes", kSize),
-                      perf::NumberParam("alignment", kAlignment),
-                      perf::StringParam("allocator", "pool")},
-                     kIterations, "ns", [&pool] {
-                       void* ptr = nullptr;
-                       auto status = pool.Allocate(&ptr, kSize, kAlignment);
-                       if (Success(status)) {
-                         status = pool.Deallocate(ptr);
-                       }
-                       perf::DoNotOptimize(status);
-                     });
-
-  Arena arena;
-  void* arena_probe = nullptr;
-  if (!Success(arena.Allocate(&arena_probe, kSize, kAlignment)) ||
-      arena_probe == nullptr) {
-    perf::SkipBenchmark("perf_memory_pool.AlignedHit",
-                        "aligned arena allocation failed during probe");
-    return;
-  }
-  arena.Deallocate(arena_probe);
+  arena.Deallocate(probe);
 
   perf::RunBenchmark("perf_memory_pool.AlignedHit",
                      {perf::NumberParam("size_bytes", kSize),
@@ -1006,13 +827,13 @@ void MeasureAlignedHit() {
 //
 // The upstream free count is reported next to the timing, because the timing
 // alone attributes the cost to the wrong thing. A trim does two separable jobs:
-// it walks bookkeeping (free lists for the size-class pool, an ordered set plus
-// a backing vector for the arena), and it issues upstream frees. On a host those
-// cost about the same and the wall time is a fair summary. On a device they do
-// not: every `cudaFree` implicitly synchronizes the whole device, so a design
-// that issues one free per cached block stalls all pending work 64 times where
-// one that frees whole backings stalls it once. Reporting both means the number
-// that transfers to a device is visible even in a host run.
+// it walks bookkeeping (an ordered set plus a backing vector), and it issues
+// upstream frees. On a host those cost about the same and the wall time is a
+// fair summary. On a device they do not: every `cudaFree` implicitly
+// synchronizes the whole device, so a design that issues one free per cached
+// block stalls all pending work 64 times where one that frees whole backings
+// stalls it once. Reporting both means the number that transfers to a device is
+// visible even in a host run.
 void MeasureReleaseCached() {
   constexpr std::size_t kSize = 4 * 1024;
   constexpr std::size_t kCachedBlocks = 64;
@@ -1024,45 +845,10 @@ void MeasureReleaseCached() {
     return;
   }
 
-  Pool pool;
-  std::vector<void*> blocks(kCachedBlocks, nullptr);
-  perf::RunBenchmark("perf_memory_pool.ReleaseCached",
-                     {perf::NumberParam("cached_blocks", kCachedBlocks),
-                      perf::NumberParam("size_bytes", kSize),
-                      perf::StringParam("allocator", "pool")},
-                     kIterations, "us", [&pool, &blocks] {
-                       for (void*& block : blocks) {
-                         pool.Allocate(&block, kSize);
-                       }
-                       for (void*& block : blocks) {
-                         pool.Deallocate(block);
-                         block = nullptr;
-                       }
-                       pool.ReleaseCached();
-                     });
-
-  // Counted in a cycle of its own rather than divided out of the timed run
-  // above: the runner's warmup and sample counts are its business, and dividing
-  // by an assumed total would go quietly wrong the moment either changes.
-  auto frees_per_trim = [&blocks](auto& allocator) {
-    const auto before = allocator.GetStats().upstream_free_count;
-    for (void*& block : blocks) {
-      allocator.Allocate(&block, kSize);
-    }
-    for (void*& block : blocks) {
-      allocator.Deallocate(block);
-      block = nullptr;
-    }
-    allocator.ReleaseCached();
-    return static_cast<double>(allocator.GetStats().upstream_free_count -
-                               before);
-  };
-
-  const auto pool_frees = frees_per_trim(pool);
-
-  // The arena's trim is cheaper by construction: 64 cached blocks live inside
-  // one backing, so a trim is one upstream free rather than 64.
+  // The arena's trim is cheap by construction: 64 cached blocks live inside one
+  // backing, so a trim is one upstream free rather than 64.
   Arena arena;
+  std::vector<void*> blocks(kCachedBlocks, nullptr);
   perf::RunBenchmark("perf_memory_pool.ReleaseCached",
                      {perf::NumberParam("cached_blocks", kCachedBlocks),
                       perf::NumberParam("size_bytes", kSize),
@@ -1078,51 +864,38 @@ void MeasureReleaseCached() {
                        arena.ReleaseCached();
                      });
 
-  const auto arena_frees = frees_per_trim(arena);
+  // Counted in a cycle of its own rather than divided out of the timed run
+  // above: the runner's warmup and sample counts are its business, and dividing
+  // by an assumed total would go quietly wrong the moment either changes.
+  const auto before = arena.GetStats().upstream_free_count;
+  for (void*& block : blocks) {
+    arena.Allocate(&block, kSize);
+  }
+  for (void*& block : blocks) {
+    arena.Deallocate(block);
+    block = nullptr;
+  }
+  arena.ReleaseCached();
+  const auto arena_frees =
+      static_cast<double>(arena.GetStats().upstream_free_count - before);
 
-  perf::PrintResult("perf_memory_pool.ReleaseCachedUpstreamFrees",
-                    {perf::NumberParam("cached_blocks", kCachedBlocks),
-                     perf::StringParam("allocator", "pool")},
-                    1, "count", pool_frees, pool_frees);
   perf::PrintResult("perf_memory_pool.ReleaseCachedUpstreamFrees",
                     {perf::NumberParam("cached_blocks", kCachedBlocks),
                      perf::StringParam("allocator", "arena")},
                     1, "count", arena_frees, arena_frees);
 
+  // The direct arm's count is exact rather than measured: freeing the working
+  // set means one upstream free per block.
   g_comparisons.push_back(Comparison{
       "ReleaseCached/frees", std::to_string(kCachedBlocks) + " cached", "calls",
-      static_cast<double>(kCachedBlocks), pool_frees, arena_frees, true});
+      static_cast<double>(kCachedBlocks), arena_frees, true, true});
 }
 
-// Accessors and no-op paths, all pool-only. The arena's `GetStats` does strictly
-// more work than the size-class pool's -- it reads the largest free extent out of
-// its ordered set -- so it is measured rather than assumed equivalent.
+// Accessors and no-op paths, all arena-only. `GetStats` reads the largest free
+// extent out of the arena's ordered set, so it does real work and is measured
+// rather than assumed free.
 void MeasureBookkeeping() {
   constexpr std::size_t kIterations = 1000000;
-  Pool pool;
-
-  perf::RunBenchmark("perf_memory_pool.GetStats",
-                     {perf::StringParam("allocator", "pool")}, kIterations, "ns",
-                     [&pool] {
-                       const auto stats = pool.GetStats();
-                       perf::DoNotOptimize(stats.bytes_in_use);
-                     });
-
-  perf::RunBenchmark("perf_memory_pool.AllocateZeroBytes",
-                     {perf::StringParam("allocator", "pool")}, kIterations, "ns",
-                     [&pool] {
-                       void* ptr = nullptr;
-                       const auto status = pool.Allocate(&ptr, 0);
-                       perf::DoNotOptimize(status);
-                       perf::DoNotOptimize(ptr);
-                     });
-
-  perf::RunBenchmark("perf_memory_pool.DeallocateNullptr",
-                     {perf::StringParam("allocator", "pool")}, kIterations, "ns",
-                     [&pool] {
-                       const auto status = pool.Deallocate(nullptr);
-                       perf::DoNotOptimize(status);
-                     });
 
   Arena arena;
   // Hold a spread of live blocks so `GetStats` walks a populated free set rather
@@ -1170,12 +943,11 @@ void PrintComparisonTable() {
   }
 
   std::cerr << "\n=== " << INFINI_RT_PERF_BACKEND_NAME
-            << ": no pool vs MemoryPool vs ArenaMemoryPool "
+            << ": no pool vs ArenaMemoryPool "
                "(median, lower is better) ===\n";
   std::cerr << std::left << std::setw(28) << "workload" << std::setw(16)
             << "params" << std::right << std::setw(14) << "no pool"
-            << std::setw(14) << "pool" << std::setw(14) << "arena"
-            << std::setw(11) << "pool" << std::setw(11) << "arena"
+            << std::setw(14) << "arena" << std::setw(11) << "arena win"
             << "\n";
 
   for (const Comparison& row : g_comparisons) {
@@ -1183,26 +955,27 @@ void PrintComparisonTable() {
       continue;
     }
     std::cerr << std::left << std::setw(28) << row.workload << std::setw(16)
-              << row.params << std::right << std::fixed << std::setprecision(3)
-              << std::setw(11) << row.direct_median << " " << row.unit
-              << std::setw(11) << row.pool_median << " " << row.unit
-              << std::setw(11) << row.arena_median << " " << row.unit;
-    // Both speedups are against the no-pool arm, so the two pools are also
-    // directly comparable to each other by dividing one column by the other.
-    for (const double value : {row.pool_median, row.arena_median}) {
-      if (value > 0.0 && row.direct_median > 0.0) {
-        std::cerr << std::setw(10) << std::setprecision(2)
-                  << (row.direct_median / value) << "x";
-      } else {
-        std::cerr << std::setw(11) << "n/a";
-      }
+              << row.params << std::right << std::fixed << std::setprecision(3);
+    if (row.has_direct) {
+      std::cerr << std::setw(11) << row.direct_median << " " << row.unit;
+    } else {
+      std::cerr << std::setw(14) << "n/a";
+    }
+    std::cerr << std::setw(11) << row.arena_median << " " << row.unit;
+
+    if (row.has_direct && row.arena_median > 0.0 && row.direct_median > 0.0) {
+      std::cerr << std::setw(10) << std::setprecision(2)
+                << (row.direct_median / row.arena_median) << "x";
+    } else {
+      std::cerr << std::setw(11) << "n/a";
     }
     std::cerr << "\n";
   }
 
-  std::cerr << "\nspeedup columns are vs the no-pool arm; divide one pool "
-               "column by the other\nto compare the two designs directly. "
-               "`calls` rows are exact counts, not timings.\n";
+  std::cerr << "\n`arena win` > 1 means the arena is faster than going straight "
+               "to the backend.\n`calls` rows are exact counts, not timings. "
+               "`n/a` in the `no pool` column marks a\nrow with no direct "
+               "counterpart -- a trim has no meaning without a cache.\n";
   std::cerr << std::endl;
 }
 
@@ -1222,12 +995,12 @@ int main() {
   CompareMixedSizeClasses();
   CompareFirstTouchGrowth();
 
-  // Both pools serialize on one mutex, so the curve past a handful of threads is
-  // about how long each design holds it. Stopping at 8 was well before the knee
-  // on a many-core host: the interesting region is where the arena's longer
-  // critical section (ordered-set lookup, split, coalesce) starts to outweigh its
-  // far smaller number of upstream calls, and that only shows up once contention
-  // is real. Counts above the machine's core count are dropped rather than
+  // The arena serializes on one mutex, so the curve past a handful of threads is
+  // about how long it holds it. Stopping at 8 was well before the knee on a
+  // many-core host: the interesting region is where the arena's critical section
+  // (ordered-set lookup, split, coalesce) starts to outweigh its far smaller
+  // number of upstream calls, and that only shows up once contention is real.
+  // Counts above the machine's core count are dropped rather than
   // oversubscribed, which would measure the scheduler.
   const auto hardware_threads = std::max<std::size_t>(
       1, static_cast<std::size_t>(std::thread::hardware_concurrency()));

@@ -1,9 +1,8 @@
 // Allocator matrix: the same workloads run across every allocation strategy
-// available on the current backend, so the three comparisons the project cares
+// available on the current backend, so the two comparisons the project cares
 // about all come out of one binary.
 //
 //   `direct`      - the backend allocator itself (`malloc` / `cudaMalloc`).
-//   `pool`        - `MemoryPool`, a size-class cache: one upstream call per miss.
 //   `arena`       - `ArenaMemoryPool`, one upstream call per backing, then slices.
 //   `cuda_async`  - `cudaMallocAsync`, CUDA's own stream-ordered pool. Present
 //                   only where the backend supports it, and *not* semantically
@@ -11,7 +10,6 @@
 //
 // Reading the output:
 //   direct vs arena   - is the arena worth having at all on this backend?
-//   pool vs arena     - which pool design wins, and on which shapes?
 //   arena vs cuda_async - does a hand-written arena beat the vendor's pool?
 //
 // `perf_memory_pool.cc` already covers the general shapes (single block,
@@ -38,7 +36,6 @@
 // stderr carries the human-readable tables.
 #include <infini/rt.h>
 #include <infini/rt/arena_memory_pool.h>
-#include <infini/rt/memory_pool.h>
 
 #include <algorithm>
 #include <atomic>
@@ -166,34 +163,6 @@ class DirectArm {
  private:
   std::size_t upstream_allocs_ = 0;
   std::size_t upstream_frees_ = 0;
-};
-
-class PoolArm {
- public:
-  static constexpr const char* kName = "pool";
-  static constexpr bool kStreamOrdered = false;
-  static constexpr bool kHasCache = true;
-
-  static bool Available() { return true; }
-
-  runtime::Error Allocate(void** ptr, std::size_t size) {
-    return pool_.Allocate(ptr, size);
-  }
-  runtime::Error Deallocate(void* ptr) { return pool_.Deallocate(ptr); }
-  void ReleaseCached() { pool_.ReleaseCached(); }
-  void Sync() {}
-
-  std::size_t UpstreamAllocs() const {
-    return pool_.GetStats().upstream_alloc_count;
-  }
-  std::size_t UpstreamFrees() const {
-    return pool_.GetStats().upstream_free_count;
-  }
-  bool TracksBytes() const { return true; }
-  std::size_t BytesReserved() const { return pool_.GetStats().bytes_reserved; }
-
- private:
-  infini::rt::MemoryPool<DispatchUpstream> pool_;
 };
 
 class ArenaArm {
@@ -1718,7 +1687,6 @@ bool PrepareRuntime() {
 template <template <typename> class Body, typename... Args>
 void ForEachArm(bool with_async, Args&&... args) {
   Body<DirectArm>{}(args...);
-  Body<PoolArm>{}(args...);
   Body<ArenaArm>{}(args...);
   if (with_async) {
     Body<CudaAsyncArm>{}(args...);

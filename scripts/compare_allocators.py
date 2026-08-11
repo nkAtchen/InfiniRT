@@ -39,8 +39,8 @@ import sys
 # The executables that emit per-allocator rows. Only `perf_allocator_matrix`
 # does: it is the one binary that runs every arm over one set of workloads, which
 # is what makes its rows pivotable into the tables below. `perf_memory_pool`
-# covers the general shapes, but only over `direct`/`pool`/`arena`, and it is
-# driven by `scripts/run_performance_tests.py` instead.
+# covers the general shapes, but only over `direct`/`arena`, and it is driven by
+# `scripts/run_performance_tests.py` instead.
 _MATRIX_TESTS = ("perf_allocator_matrix",)
 
 # Each backend's build tree, the CMake options that select it, and whether a
@@ -59,14 +59,13 @@ _BACKENDS = (
     },
 )
 
-# The three comparisons, as (baseline, candidate) arm pairs. `arena` is the
+# The two comparisons, as (baseline, candidate) arm pairs. `arena` is the
 # candidate in every one -- including against `cuda_async`, where the natural
 # phrasing would put the vendor's pool second. Keeping the arena in the candidate
 # column means the win column always answers the same question, "should we adopt
 # this thing", instead of flipping direction in the middle of the report.
 _COMPARISONS = (
     ("direct", "arena", "the backend allocator vs the arena"),
-    ("pool", "arena", "the size-class pool vs the arena"),
     ("cuda_async", "arena", "the vendor's stream-ordered pool vs the arena"),
 )
 
